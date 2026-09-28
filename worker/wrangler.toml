@@ -6,6 +6,6 @@ compatibility_date = "2024-01-01"
 #   wrangler d1 create fb-bidding-db
 # then paste the database_id returned below.
 [[d1_databases]]
-binding      = "DB"          # accessed as env.DB inside the Worker
+binding       = "DB"          # accessed as env.DB inside the Worker
 database_name = "fb-bidding-db"
-database_id  = "PASTE_YOUR_D1_DATABASE_ID_HERE"
+database_id   = "c8fb9a59-4b9b-4fe9-ade7-4366a322cfc2"
