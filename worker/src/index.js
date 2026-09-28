@@ -140,6 +140,47 @@ export default {
       });
     }
 
+    // ── POST /api/open-auction ────────────────────────────────────────────
+    if (request.method === "POST" && url.pathname === "/api/open-auction") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response("Bad JSON", { status: 400, headers: cors });
+      }
+
+      const itemName  = (body?.item_name  ?? "").trim();
+      const basePrice = parseFloat(body?.base_price ?? 0);
+
+      if (!itemName) {
+        return new Response(JSON.stringify({ error: "item_name is required" }), {
+          status: 400,
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      // Close any currently active auction first (only one live at a time)
+      await env.DB
+        .prepare("UPDATE Auctions SET status = 'closed' WHERE status = 'active'")
+        .run();
+
+      // Insert the new auction
+      const result = await env.DB
+        .prepare("INSERT INTO Auctions (item_name, base_price, status) VALUES (?, ?, 'active')")
+        .bind(itemName, isNaN(basePrice) ? 0 : basePrice)
+        .run();
+
+      const newAuction = await env.DB
+        .prepare("SELECT * FROM Auctions WHERE id = ?")
+        .bind(result.meta.last_row_id)
+        .first();
+
+      return new Response(JSON.stringify({ opened: true, auction: newAuction }), {
+        status: 201,
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+
     return new Response("Not Found", { status: 404, headers: cors });
   },
 };
