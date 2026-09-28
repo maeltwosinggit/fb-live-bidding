@@ -1,152 +1,139 @@
 /**
  * Cloudflare Worker — FB Live Bidding Backend
  * Routes:
- *   POST /webhook  — receives Meta Graph API live-comment payloads, extracts bids
- *   GET  /api/bids — returns top-10 bids for the active auction
- *   POST /api/close-auction — closes active auction, returns winner checkout link
+ *   POST /webhook              — Meta Graph API live-comment payloads → bid parser
+ *   GET  /api/bids             — ALL active auctions + top-10 bids each
+ *   GET  /api/bids?auction=ID  — single auction bids (used by /bid page)
+ *   POST /api/bid              — direct bid { auction_id, bidder_name, bid_amount }
+ *   POST /api/open-auction     — open a new auction (parallel-safe, no auto-close)
+ *   POST /api/close-auction    — close a specific auction { auction_id }
  */
 
-// Regex: matches "+RM50", "+RM 120.50", "+rm200" (case-insensitive)
 const BID_REGEX = /\+\s*RM\s*(\d+(?:\.\d{1,2})?)/i;
+
+// Reusable: fetch top-10 bids for one auction
+async function getTopBids(db, auctionId) {
+  const { results } = await db
+    .prepare(`
+      SELECT bidder_name, MAX(bid_amount) AS bid_amount, MAX(timestamp) AS timestamp
+      FROM Bids
+      WHERE auction_id = ?
+      GROUP BY bidder_name
+      ORDER BY bid_amount DESC
+      LIMIT 10
+    `)
+    .bind(auctionId)
+    .all();
+  return results;
+}
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // ── CORS headers so the Next.js dashboard (any origin) can call this ──
     const cors = {
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin":  "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
     };
+    const json = (data, status = 200) =>
+      new Response(JSON.stringify(data), {
+        status,
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: cors });
-    }
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
 
     // ── POST /webhook ────────────────────────────────────────────────────
     if (request.method === "POST" && url.pathname === "/webhook") {
       let body;
-      try {
-        body = await request.json();
-      } catch {
-        return new Response("Bad JSON", { status: 400, headers: cors });
-      }
+      try { body = await request.json(); } catch { return new Response("Bad JSON", { status: 400, headers: cors }); }
 
-      // Meta Graph API wraps events in entry[].changes[]
-      // Shape: { entry: [{ changes: [{ value: { from: { name }, message } }] }] }
       const changes = body?.entry?.[0]?.changes ?? [];
-
       for (const change of changes) {
-        const value = change?.value ?? {};
-        const message = value?.message ?? "";
+        const value      = change?.value ?? {};
+        const message    = value?.message ?? "";
         const bidderName = value?.from?.name ?? "Anonymous";
-
-        const match = BID_REGEX.exec(message);
-        if (!match) continue; // comment is not a bid — skip
+        const match      = BID_REGEX.exec(message);
+        if (!match) continue;
 
         const bidAmount = parseFloat(match[1]);
-
-        // Fetch the active auction
+        // Webhook bids go to the first active auction (FB Live = one stream at a time)
         const auction = await env.DB
-          .prepare("SELECT id, base_price FROM Auctions WHERE status = 'active' LIMIT 1")
+          .prepare("SELECT id, base_price FROM Auctions WHERE status = 'active' ORDER BY id DESC LIMIT 1")
           .first();
+        if (!auction || bidAmount <= auction.base_price) continue;
 
-        if (!auction) continue; // no active auction
-
-        // Only accept bids above the base price
-        if (bidAmount <= auction.base_price) continue;
-
-        // Insert the bid — D1 handles concurrent writes safely
         await env.DB
-          .prepare(
-            "INSERT INTO Bids (auction_id, bidder_name, bid_amount) VALUES (?, ?, ?)"
-          )
+          .prepare("INSERT INTO Bids (auction_id, bidder_name, bid_amount) VALUES (?, ?, ?)")
           .bind(auction.id, bidderName, bidAmount)
           .run();
       }
-
-      // Meta requires a 200 to acknowledge the webhook
-      return new Response(JSON.stringify({ ok: true }), {
-        status: 200,
-        headers: { ...cors, "Content-Type": "application/json" },
-      });
+      return json({ ok: true });
     }
 
     // ── GET /api/bids ─────────────────────────────────────────────────────
+    // ?auction=ID → single auction (for /bid page)
+    // no param    → all active auctions (for seller dashboard)
     if (request.method === "GET" && url.pathname === "/api/bids") {
-      const auction = await env.DB
-        .prepare("SELECT * FROM Auctions WHERE status = 'active' LIMIT 1")
-        .first();
+      const auctionId = url.searchParams.get("auction");
 
-      if (!auction) {
-        return new Response(JSON.stringify({ auction: null, bids: [] }), {
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
+      if (auctionId) {
+        // Single auction lookup — used by the /bid page
+        const auction = await env.DB
+          .prepare("SELECT * FROM Auctions WHERE id = ?")
+          .bind(parseInt(auctionId))
+          .first();
+        if (!auction) return json({ auction: null, bids: [] });
+        const bids = await getTopBids(env.DB, auction.id);
+        return json({ auction, bids });
       }
 
-      // Top 10 unique bidders — highest bid per bidder, ordered descending
-      const { results } = await env.DB
-        .prepare(`
-          SELECT bidder_name, MAX(bid_amount) AS bid_amount, MAX(timestamp) AS timestamp
-          FROM Bids
-          WHERE auction_id = ?
-          GROUP BY bidder_name
-          ORDER BY bid_amount DESC
-          LIMIT 10
-        `)
-        .bind(auction.id)
+      // All active auctions with their bids — used by the seller dashboard
+      const { results: auctions } = await env.DB
+        .prepare("SELECT * FROM Auctions WHERE status = 'active' ORDER BY id DESC")
         .all();
 
-      return new Response(JSON.stringify({ auction, bids: results }), {
-        headers: { ...cors, "Content-Type": "application/json" },
-      });
+      if (!auctions.length) return json({ auctions: [], allBids: {} });
+
+      // Fetch bids for every active auction in parallel
+      const bidMap = {};
+      await Promise.all(
+        auctions.map(async (a) => {
+          bidMap[a.id] = await getTopBids(env.DB, a.id);
+        })
+      );
+
+      return json({ auctions, allBids: bidMap });
     }
 
-    // ── POST /api/bid — direct bid submission from the /bid page ─────────
+    // ── POST /api/bid ─────────────────────────────────────────────────────
     if (request.method === "POST" && url.pathname === "/api/bid") {
       let body;
-      try {
-        body = await request.json();
-      } catch {
-        return new Response("Bad JSON", { status: 400, headers: cors });
-      }
+      try { body = await request.json(); } catch { return new Response("Bad JSON", { status: 400, headers: cors }); }
 
       const bidderName = (body?.bidder_name ?? "").trim();
       const bidAmount  = parseFloat(body?.bid_amount ?? 0);
+      const auctionId  = parseInt(body?.auction_id ?? 0);
 
-      if (!bidderName) {
-        return new Response(JSON.stringify({ error: "bidder_name is required" }), {
-          status: 400, headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
-      if (!bidAmount || isNaN(bidAmount) || bidAmount <= 0) {
-        return new Response(JSON.stringify({ error: "bid_amount must be a positive number" }), {
-          status: 400, headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
+      if (!bidderName)                          return json({ error: "bidder_name is required" }, 400);
+      if (!bidAmount || isNaN(bidAmount))        return json({ error: "bid_amount must be a positive number" }, 400);
+      if (!auctionId || isNaN(auctionId))        return json({ error: "auction_id is required" }, 400);
 
       const auction = await env.DB
-        .prepare("SELECT * FROM Auctions WHERE status = 'active' LIMIT 1")
+        .prepare("SELECT * FROM Auctions WHERE id = ? AND status = 'active'")
+        .bind(auctionId)
         .first();
 
-      if (!auction) {
-        return new Response(JSON.stringify({ error: "No active auction" }), {
-          status: 404, headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
-      if (bidAmount <= auction.base_price) {
-        return new Response(JSON.stringify({ error: `Bid must be above the base price of RM ${auction.base_price}` }), {
-          status: 422, headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
+      if (!auction)                             return json({ error: "Auction not found or already closed" }, 404);
+      if (bidAmount <= auction.base_price)       return json({ error: `Bid must be above RM ${auction.base_price}` }, 422);
 
       await env.DB
         .prepare("INSERT INTO Bids (auction_id, bidder_name, bid_amount) VALUES (?, ?, ?)")
-        .bind(auction.id, bidderName, bidAmount)
+        .bind(auctionId, bidderName, bidAmount)
         .run();
 
-      // Return the bidder's current rank
+      // Return current rank for the bidder
       const rank = await env.DB
         .prepare(`
           SELECT COUNT(*) AS rank FROM (
@@ -155,81 +142,28 @@ export default {
             GROUP BY bidder_name
           ) WHERE top_bid > ?
         `)
-        .bind(auction.id, bidAmount)
+        .bind(auctionId, bidAmount)
         .first();
 
-      return new Response(JSON.stringify({
-        ok: true,
-        auction: { item_name: auction.item_name, base_price: auction.base_price },
+      return json({
+        ok:         true,
+        auction:    { item_name: auction.item_name, base_price: auction.base_price },
         bid_amount: bidAmount,
-        rank: (rank?.rank ?? 0) + 1,   // 1-based
-      }), {
-        status: 201, headers: { ...cors, "Content-Type": "application/json" },
-      });
-    }
-
-    // ── POST /api/close-auction ───────────────────────────────────────────
-    if (request.method === "POST" && url.pathname === "/api/close-auction") {
-      const auction = await env.DB
-        .prepare("SELECT id FROM Auctions WHERE status = 'active' LIMIT 1")
-        .first();
-
-      if (!auction) {
-        return new Response(JSON.stringify({ error: "No active auction" }), {
-          status: 404,
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
-
-      // Mark auction as closed
-      await env.DB
-        .prepare("UPDATE Auctions SET status = 'closed' WHERE id = ?")
-        .bind(auction.id)
-        .run();
-
-      // Find the winner (highest single bid)
-      const winner = await env.DB
-        .prepare(
-          "SELECT bidder_name, MAX(bid_amount) AS bid_amount FROM Bids WHERE auction_id = ? LIMIT 1"
-        )
-        .bind(auction.id)
-        .first();
-
-      // Generate a mock checkout link (replace with real payment gateway in prod)
-      const checkoutLink = winner
-        ? `https://pay.example.com/checkout?buyer=${encodeURIComponent(winner.bidder_name)}&amount=${winner.bid_amount}&auction=${auction.id}`
-        : null;
-
-      return new Response(JSON.stringify({ closed: true, winner, checkoutLink }), {
-        headers: { ...cors, "Content-Type": "application/json" },
-      });
+        rank:       (rank?.rank ?? 0) + 1,
+      }, 201);
     }
 
     // ── POST /api/open-auction ────────────────────────────────────────────
     if (request.method === "POST" && url.pathname === "/api/open-auction") {
       let body;
-      try {
-        body = await request.json();
-      } catch {
-        return new Response("Bad JSON", { status: 400, headers: cors });
-      }
+      try { body = await request.json(); } catch { return new Response("Bad JSON", { status: 400, headers: cors }); }
 
-      const itemName  = (body?.item_name  ?? "").trim();
+      const itemName  = (body?.item_name ?? "").trim();
       const basePrice = parseFloat(body?.base_price ?? 0);
 
-      if (!itemName) {
-        return new Response(JSON.stringify({ error: "item_name is required" }), {
-          status: 400,
-          headers: { ...cors, "Content-Type": "application/json" },
-        });
-      }
+      if (!itemName) return json({ error: "item_name is required" }, 400);
 
-      // Close any currently active auction first (only one live at a time)
-      await env.DB
-        .prepare("UPDATE Auctions SET status = 'closed' WHERE status = 'active'")
-        .run();
-
-      // Insert the new auction
+      // No longer closes existing auctions — parallel bidding is supported
       const result = await env.DB
         .prepare("INSERT INTO Auctions (item_name, base_price, status) VALUES (?, ?, 'active')")
         .bind(itemName, isNaN(basePrice) ? 0 : basePrice)
@@ -240,10 +174,39 @@ export default {
         .bind(result.meta.last_row_id)
         .first();
 
-      return new Response(JSON.stringify({ opened: true, auction: newAuction }), {
-        status: 201,
-        headers: { ...cors, "Content-Type": "application/json" },
-      });
+      return json({ opened: true, auction: newAuction }, 201);
+    }
+
+    // ── POST /api/close-auction ───────────────────────────────────────────
+    if (request.method === "POST" && url.pathname === "/api/close-auction") {
+      let body;
+      try { body = await request.json(); } catch { return new Response("Bad JSON", { status: 400, headers: cors }); }
+
+      const auctionId = parseInt(body?.auction_id ?? 0);
+      if (!auctionId || isNaN(auctionId)) return json({ error: "auction_id is required" }, 400);
+
+      const auction = await env.DB
+        .prepare("SELECT id FROM Auctions WHERE id = ? AND status = 'active'")
+        .bind(auctionId)
+        .first();
+
+      if (!auction) return json({ error: "Auction not found or already closed" }, 404);
+
+      await env.DB
+        .prepare("UPDATE Auctions SET status = 'closed' WHERE id = ?")
+        .bind(auctionId)
+        .run();
+
+      const winner = await env.DB
+        .prepare("SELECT bidder_name, MAX(bid_amount) AS bid_amount FROM Bids WHERE auction_id = ? LIMIT 1")
+        .bind(auctionId)
+        .first();
+
+      const checkoutLink = winner
+        ? `https://pay.example.com/checkout?buyer=${encodeURIComponent(winner.bidder_name)}&amount=${winner.bid_amount}&auction=${auctionId}`
+        : null;
+
+      return json({ closed: true, winner, checkoutLink });
     }
 
     return new Response("Not Found", { status: 404, headers: cors });

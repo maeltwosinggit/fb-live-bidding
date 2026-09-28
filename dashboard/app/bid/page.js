@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, Suspense } from "react";
+import { useSearchParams } from "next/navigation";
 
 const WORKER_URL = process.env.NEXT_PUBLIC_WORKER_URL || "http://localhost:8787";
 
@@ -11,29 +12,32 @@ function ordinal(n) {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
-export default function BidPage() {
-  const [auction, setAuction]     = useState(null);       // active auction info
-  const [loading, setLoading]     = useState(true);       // initial load
-  const [name, setName]           = useState("");
-  const [amount, setAmount]       = useState("");
+// Inner component that uses useSearchParams (must be inside Suspense for static export)
+function BidPageInner() {
+  const searchParams  = useSearchParams();
+  const auctionId     = searchParams.get("auction"); // e.g. ?auction=3
+
+  const [auction, setAuction]       = useState(null);
+  const [loading, setLoading]       = useState(true);
+  const [name, setName]             = useState("");
+  const [amount, setAmount]         = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [result, setResult]         = useState(null);
+  const [error, setError]           = useState(null);
 
-  // Result state after a successful bid
-  const [result, setResult]       = useState(null);  // { rank, bid_amount, item_name }
-  const [error, setError]         = useState(null);
-
-  // ── Load the active auction on mount ────────────────────────────────
+  // ── Load the specific auction by ID ──────────────────────────────────
   const loadAuction = useCallback(async () => {
     try {
-      const res  = await fetch(`${WORKER_URL}/api/bids`);
-      const data = await res.json();
+      const query = auctionId ? `?auction=${auctionId}` : "";
+      const res   = await fetch(`${WORKER_URL}/api/bids${query}`);
+      const data  = await res.json();
       setAuction(data.auction ?? null);
     } catch {
       setError("Could not connect. Please try again.");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [auctionId]);
 
   useEffect(() => { loadAuction(); }, [loadAuction]);
 
@@ -49,6 +53,7 @@ export default function BidPage() {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          auction_id:  parseInt(auctionId),   // pass the specific auction ID
           bidder_name: name.trim(),
           bid_amount:  parseFloat(amount),
         }),
@@ -220,5 +225,18 @@ export default function BidPage() {
         </p>
       </div>
     </main>
+  );
+}
+
+// Suspense wrapper required by Next.js static export when using useSearchParams
+export default function BidPage() {
+  return (
+    <Suspense fallback={
+      <main className="min-h-screen bg-gray-950 flex items-center justify-center">
+        <div className="text-gray-500 text-sm animate-pulse">Loading…</div>
+      </main>
+    }>
+      <BidPageInner />
+    </Suspense>
   );
 }
