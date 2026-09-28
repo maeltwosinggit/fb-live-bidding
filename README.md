@@ -3,6 +3,8 @@
 Real-time Facebook Live auction bidding backend for SME e-commerce sellers.
 
 > **Live demo:** [https://fb-live-bidding-worker.ungkuadrian.workers.dev](https://fb-live-bidding-worker.ungkuadrian.workers.dev)
+> <img width="1917" height="982" alt="image" src="https://github.com/user-attachments/assets/f0f338f5-4363-4222-8a6a-5ca4fc604916" />
+
 
 ## How it works
 
