@@ -198,8 +198,8 @@ function BidPageInner() {
               <input
                 type="number"
                 placeholder={`${Number(auction.base_price) + 1}`}
-                min={Number(auction.base_price) + 0.01}
-                step="1"
+                min={Number(auction.base_price) + 1}
+                step="any"
                 value={amount}
                 onChange={e => setAmount(e.target.value)}
                 required
