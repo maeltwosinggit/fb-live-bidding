@@ -103,6 +103,71 @@ export default {
       });
     }
 
+    // ── POST /api/bid — direct bid submission from the /bid page ─────────
+    if (request.method === "POST" && url.pathname === "/api/bid") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response("Bad JSON", { status: 400, headers: cors });
+      }
+
+      const bidderName = (body?.bidder_name ?? "").trim();
+      const bidAmount  = parseFloat(body?.bid_amount ?? 0);
+
+      if (!bidderName) {
+        return new Response(JSON.stringify({ error: "bidder_name is required" }), {
+          status: 400, headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+      if (!bidAmount || isNaN(bidAmount) || bidAmount <= 0) {
+        return new Response(JSON.stringify({ error: "bid_amount must be a positive number" }), {
+          status: 400, headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      const auction = await env.DB
+        .prepare("SELECT * FROM Auctions WHERE status = 'active' LIMIT 1")
+        .first();
+
+      if (!auction) {
+        return new Response(JSON.stringify({ error: "No active auction" }), {
+          status: 404, headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+      if (bidAmount <= auction.base_price) {
+        return new Response(JSON.stringify({ error: `Bid must be above the base price of RM ${auction.base_price}` }), {
+          status: 422, headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      await env.DB
+        .prepare("INSERT INTO Bids (auction_id, bidder_name, bid_amount) VALUES (?, ?, ?)")
+        .bind(auction.id, bidderName, bidAmount)
+        .run();
+
+      // Return the bidder's current rank
+      const rank = await env.DB
+        .prepare(`
+          SELECT COUNT(*) AS rank FROM (
+            SELECT bidder_name, MAX(bid_amount) AS top_bid
+            FROM Bids WHERE auction_id = ?
+            GROUP BY bidder_name
+          ) WHERE top_bid > ?
+        `)
+        .bind(auction.id, bidAmount)
+        .first();
+
+      return new Response(JSON.stringify({
+        ok: true,
+        auction: { item_name: auction.item_name, base_price: auction.base_price },
+        bid_amount: bidAmount,
+        rank: (rank?.rank ?? 0) + 1,   // 1-based
+      }), {
+        status: 201, headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+
     // ── POST /api/close-auction ───────────────────────────────────────────
     if (request.method === "POST" && url.pathname === "/api/close-auction") {
       const auction = await env.DB

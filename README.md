@@ -14,6 +14,7 @@ Viewers comment `+RM<amount>` during a Facebook Live stream. The Meta Graph API 
 |--------|-----|-------------|
 | `POST` | `https://fb-live-bidding-worker.ungkuadrian.workers.dev/webhook` | Receives Meta Graph API live-comment events |
 | `GET`  | `https://fb-live-bidding-worker.ungkuadrian.workers.dev/api/bids` | Active auction + top-10 leaderboard |
+| `POST` | `https://fb-live-bidding-worker.ungkuadrian.workers.dev/api/bid` | Direct bid from the `/bid` page (name + amount) |
 | `POST` | `https://fb-live-bidding-worker.ungkuadrian.workers.dev/api/open-auction` | Open a new auction |
 | `POST` | `https://fb-live-bidding-worker.ungkuadrian.workers.dev/api/close-auction` | Close auction, get winner + checkout link |
 
@@ -37,7 +38,9 @@ fb-live-bidding/
 └── dashboard/
     ├── .env.local              # NEXT_PUBLIC_WORKER_URL
     └── app/
-        └── page.js             # Seller Dashboard (Next.js)
+        ├── page.js             # Seller Dashboard (Next.js)
+        └── bid/
+            └── page.js         # Bidder page — scan QR → place bid directly
 ```
 
 ## Webhook payload format (Meta Graph API)

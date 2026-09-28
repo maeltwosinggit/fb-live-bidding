@@ -55,8 +55,7 @@ function QRPanel({ url, itemName }) {
           </p>
           <p className="text-white font-bold text-lg leading-tight mb-1">{itemName}</p>
           <p className="text-gray-400 text-sm mb-4">
-            Viewers scan this QR to open the live stream and bid by commenting{" "}
-            <span className="font-mono text-white bg-gray-800 px-1.5 py-0.5 rounded">+RM50</span>
+            Viewers scan this QR to open the bidding page and place a bid directly — no Facebook comments needed.
           </p>
 
           {/* URL pill */}
@@ -97,10 +96,12 @@ export default function SellerDashboard() {
   // Open Auction form state
   const [itemName, setItemName]   = useState("");
   const [basePrice, setBasePrice] = useState("");
-  const [fbLiveUrl, setFbLiveUrl] = useState("");  // seller pastes their FB Live URL
   const [opening, setOpening]     = useState(false);
 
-  // The URL baked into the QR — stored separately so it survives poll cycles
+  // QR always points to the /bid page on this same domain
+  const BID_PAGE_URL = typeof window !== "undefined"
+    ? `${window.location.origin}/bid`
+    : "https://fb-live-bidding-dashboard.pages.dev/bid";
   const [qrUrl, setQrUrl] = useState("");
 
   // ── Poll /api/bids every 2 seconds ───────────────────────────────────
@@ -146,11 +147,10 @@ export default function SellerDashboard() {
         setClosed(false);
         setWinner(null);
         setCheckoutLink(null);
-        // Use the seller's FB Live URL if provided, else fall back to a generic bid page
-        setQrUrl(fbLiveUrl.trim() || `${WORKER_URL}/api/bids?auction=${data.auction.id}`);
+        // QR always points to the /bid page so scanners can place bids directly
+        setQrUrl(BID_PAGE_URL);
         setItemName("");
         setBasePrice("");
-        setFbLiveUrl("");
       } else {
         setError(data.error ?? "Failed to open auction.");
       }
@@ -249,21 +249,6 @@ export default function SellerDashboard() {
                 className="w-full bg-gray-800 border border-gray-600 text-white rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-600"
               />
               <p className="text-xs text-gray-600 mt-1">Bids below this amount will be rejected.</p>
-            </div>
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">
-                Facebook Live URL <span className="text-gray-600">(optional — baked into the QR code)</span>
-              </label>
-              <input
-                type="url"
-                placeholder="https://www.facebook.com/yourpage/videos/123456789"
-                value={fbLiveUrl}
-                onChange={e => setFbLiveUrl(e.target.value)}
-                className="w-full bg-gray-800 border border-gray-600 text-white rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-600"
-              />
-              <p className="text-xs text-gray-600 mt-1">
-                Scanning the QR will take viewers directly to your live stream. Leave blank to use the bid API URL.
-              </p>
             </div>
             <button
               type="submit"
