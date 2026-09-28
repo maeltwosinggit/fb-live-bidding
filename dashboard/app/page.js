@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import QRCode from "qrcode";
 
 const WORKER_URL = process.env.NEXT_PUBLIC_WORKER_URL || "http://localhost:8787";
 
@@ -10,6 +11,80 @@ const RANK_STYLES = [
   "bg-amber-600 text-amber-100",
 ];
 
+// ── QR Code canvas component ──────────────────────────────────────────────
+// Renders `url` into a <canvas> using the qrcode library (no external requests).
+function QRPanel({ url, itemName }) {
+  const canvasRef = useRef(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!canvasRef.current || !url) return;
+    QRCode.toCanvas(canvasRef.current, url, {
+      width: 200,
+      margin: 2,
+      color: { dark: "#ffffff", light: "#111827" }, // white dots on dark bg
+    });
+  }, [url]);
+
+  function handleCopy() {
+    navigator.clipboard.writeText(url).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }
+
+  function handleDownload() {
+    const link = document.createElement("a");
+    link.download = `bid-qr-${itemName.replace(/\s+/g, "-").toLowerCase()}.png`;
+    link.href = canvasRef.current.toDataURL("image/png");
+    link.click();
+  }
+
+  return (
+    <div className="w-full max-w-2xl mb-6 bg-gray-900 border border-gray-700 rounded-2xl px-6 py-5">
+      <div className="flex flex-col sm:flex-row items-center gap-6">
+        {/* QR canvas */}
+        <div className="bg-gray-800 rounded-xl p-3 flex-shrink-0">
+          <canvas ref={canvasRef} className="rounded-lg" />
+        </div>
+
+        {/* Info + actions */}
+        <div className="flex-1 min-w-0">
+          <p className="text-xs text-blue-400 font-semibold uppercase tracking-widest mb-1">
+            Scan to Join Auction
+          </p>
+          <p className="text-white font-bold text-lg leading-tight mb-1">{itemName}</p>
+          <p className="text-gray-400 text-sm mb-4">
+            Viewers scan this QR to open the live stream and bid by commenting{" "}
+            <span className="font-mono text-white bg-gray-800 px-1.5 py-0.5 rounded">+RM50</span>
+          </p>
+
+          {/* URL pill */}
+          <p className="text-xs text-gray-600 font-mono truncate mb-3 bg-gray-800 px-3 py-1.5 rounded-lg">
+            {url}
+          </p>
+
+          <div className="flex gap-2 flex-wrap">
+            <button
+              onClick={handleCopy}
+              className="bg-gray-700 hover:bg-gray-600 text-white text-xs font-semibold px-4 py-2 rounded-lg transition"
+            >
+              {copied ? "✓ Copied!" : "📋 Copy Link"}
+            </button>
+            <button
+              onClick={handleDownload}
+              className="bg-gray-700 hover:bg-gray-600 text-white text-xs font-semibold px-4 py-2 rounded-lg transition"
+            >
+              ⬇ Download QR
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main dashboard ────────────────────────────────────────────────────────
 export default function SellerDashboard() {
   const [auction, setAuction]           = useState(null);
   const [bids, setBids]                 = useState([]);
@@ -19,10 +94,14 @@ export default function SellerDashboard() {
   const [lastUpdated, setLastUpdated]   = useState(null);
   const [error, setError]               = useState(null);
 
-  // ── Open Auction form state ───────────────────────────────────────────
-  const [itemName, setItemName]     = useState("");
-  const [basePrice, setBasePrice]   = useState("");
-  const [opening, setOpening]       = useState(false);
+  // Open Auction form state
+  const [itemName, setItemName]   = useState("");
+  const [basePrice, setBasePrice] = useState("");
+  const [fbLiveUrl, setFbLiveUrl] = useState("");  // seller pastes their FB Live URL
+  const [opening, setOpening]     = useState(false);
+
+  // The URL baked into the QR — stored separately so it survives poll cycles
+  const [qrUrl, setQrUrl] = useState("");
 
   // ── Poll /api/bids every 2 seconds ───────────────────────────────────
   const fetchBids = useCallback(async () => {
@@ -33,9 +112,8 @@ export default function SellerDashboard() {
       setBids(data.bids ?? []);
       setLastUpdated(new Date().toLocaleTimeString());
       setError(null);
-      if (data.auction?.status === "closed") setClosed(true);
-      // Reset closed state if a fresh auction was opened elsewhere
-      if (data.auction?.status === "active") setClosed(false);
+      if (data.auction?.status === "closed")  setClosed(true);
+      if (data.auction?.status === "active")  setClosed(false);
     } catch {
       setError("Cannot reach Worker — is it running?");
     }
@@ -56,7 +134,10 @@ export default function SellerDashboard() {
       const res  = await fetch(`${WORKER_URL}/api/open-auction`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ item_name: itemName.trim(), base_price: parseFloat(basePrice) || 0 }),
+        body: JSON.stringify({
+          item_name:  itemName.trim(),
+          base_price: parseFloat(basePrice) || 0,
+        }),
       });
       const data = await res.json();
       if (data.opened) {
@@ -65,8 +146,11 @@ export default function SellerDashboard() {
         setClosed(false);
         setWinner(null);
         setCheckoutLink(null);
+        // Use the seller's FB Live URL if provided, else fall back to a generic bid page
+        setQrUrl(fbLiveUrl.trim() || `${WORKER_URL}/api/bids?auction=${data.auction.id}`);
         setItemName("");
         setBasePrice("");
+        setFbLiveUrl("");
       } else {
         setError(data.error ?? "Failed to open auction.");
       }
@@ -85,12 +169,13 @@ export default function SellerDashboard() {
       setClosed(true);
       setWinner(data.winner);
       setCheckoutLink(data.checkoutLink);
+      setQrUrl(""); // hide QR when auction ends
     } catch {
       setError("Failed to close auction.");
     }
   }
 
-  const topBidder = bids[0] ?? null;
+  const topBidder        = bids[0] ?? null;
   const hasActiveAuction = auction && auction.status === "active" && !closed;
 
   return (
@@ -102,7 +187,7 @@ export default function SellerDashboard() {
           <h1 className="text-3xl font-bold tracking-tight">🔴 FB Live Bidding</h1>
           <p className="text-gray-400 text-sm mt-1">
             {hasActiveAuction
-              ? <>Item: <span className="text-white font-medium">{auction.item_name}</span> · Base price: <span className="text-green-400">RM {auction.base_price}</span></>
+              ? <>Item: <span className="text-white font-medium">{auction.item_name}</span> · Base: <span className="text-green-400">RM {auction.base_price}</span></>
               : closed ? "Auction closed" : "No active auction"}
           </p>
         </div>
@@ -129,7 +214,12 @@ export default function SellerDashboard() {
         </div>
       )}
 
-      {/* ── OPEN AUCTION FORM — shown when no active auction ─────────────── */}
+      {/* ── QR Code — shown while auction is active ─────────────────────── */}
+      {hasActiveAuction && qrUrl && (
+        <QRPanel url={qrUrl} itemName={auction.item_name} />
+      )}
+
+      {/* ── Open Auction form — shown when no active auction ─────────────── */}
       {!hasActiveAuction && (
         <div className="w-full max-w-2xl mb-8 bg-gray-900 border border-gray-700 rounded-2xl px-6 py-6">
           <h2 className="text-lg font-bold mb-4 text-white">
@@ -159,6 +249,21 @@ export default function SellerDashboard() {
                 className="w-full bg-gray-800 border border-gray-600 text-white rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-600"
               />
               <p className="text-xs text-gray-600 mt-1">Bids below this amount will be rejected.</p>
+            </div>
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">
+                Facebook Live URL <span className="text-gray-600">(optional — baked into the QR code)</span>
+              </label>
+              <input
+                type="url"
+                placeholder="https://www.facebook.com/yourpage/videos/123456789"
+                value={fbLiveUrl}
+                onChange={e => setFbLiveUrl(e.target.value)}
+                className="w-full bg-gray-800 border border-gray-600 text-white rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-600"
+              />
+              <p className="text-xs text-gray-600 mt-1">
+                Scanning the QR will take viewers directly to your live stream. Leave blank to use the bid API URL.
+              </p>
             </div>
             <button
               type="submit"
@@ -200,10 +305,10 @@ export default function SellerDashboard() {
                 {lastUpdated ? `Updated ${lastUpdated}` : "Loading..."}
               </span>
             </div>
-
             {bids.length === 0 ? (
               <div className="text-center text-gray-500 py-16 text-sm">
-                Waiting for bids… tell viewers to comment <span className="text-white font-mono">+RM50</span>
+                Waiting for bids… tell viewers to comment{" "}
+                <span className="text-white font-mono">+RM50</span>
               </div>
             ) : (
               <ul>
