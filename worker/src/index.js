@@ -1,0 +1,145 @@
+/**
+ * Cloudflare Worker — FB Live Bidding Backend
+ * Routes:
+ *   POST /webhook  — receives Meta Graph API live-comment payloads, extracts bids
+ *   GET  /api/bids — returns top-10 bids for the active auction
+ *   POST /api/close-auction — closes active auction, returns winner checkout link
+ */
+
+// Regex: matches "+RM50", "+RM 120.50", "+rm200" (case-insensitive)
+const BID_REGEX = /\+\s*RM\s*(\d+(?:\.\d{1,2})?)/i;
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    // ── CORS headers so the Next.js dashboard (any origin) can call this ──
+    const cors = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors });
+    }
+
+    // ── POST /webhook ────────────────────────────────────────────────────
+    if (request.method === "POST" && url.pathname === "/webhook") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response("Bad JSON", { status: 400, headers: cors });
+      }
+
+      // Meta Graph API wraps events in entry[].changes[]
+      // Shape: { entry: [{ changes: [{ value: { from: { name }, message } }] }] }
+      const changes = body?.entry?.[0]?.changes ?? [];
+
+      for (const change of changes) {
+        const value = change?.value ?? {};
+        const message = value?.message ?? "";
+        const bidderName = value?.from?.name ?? "Anonymous";
+
+        const match = BID_REGEX.exec(message);
+        if (!match) continue; // comment is not a bid — skip
+
+        const bidAmount = parseFloat(match[1]);
+
+        // Fetch the active auction
+        const auction = await env.DB
+          .prepare("SELECT id, base_price FROM Auctions WHERE status = 'active' LIMIT 1")
+          .first();
+
+        if (!auction) continue; // no active auction
+
+        // Only accept bids above the base price
+        if (bidAmount <= auction.base_price) continue;
+
+        // Insert the bid — D1 handles concurrent writes safely
+        await env.DB
+          .prepare(
+            "INSERT INTO Bids (auction_id, bidder_name, bid_amount) VALUES (?, ?, ?)"
+          )
+          .bind(auction.id, bidderName, bidAmount)
+          .run();
+      }
+
+      // Meta requires a 200 to acknowledge the webhook
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+
+    // ── GET /api/bids ─────────────────────────────────────────────────────
+    if (request.method === "GET" && url.pathname === "/api/bids") {
+      const auction = await env.DB
+        .prepare("SELECT * FROM Auctions WHERE status = 'active' LIMIT 1")
+        .first();
+
+      if (!auction) {
+        return new Response(JSON.stringify({ auction: null, bids: [] }), {
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      // Top 10 unique bidders — highest bid per bidder, ordered descending
+      const { results } = await env.DB
+        .prepare(`
+          SELECT bidder_name, MAX(bid_amount) AS bid_amount, MAX(timestamp) AS timestamp
+          FROM Bids
+          WHERE auction_id = ?
+          GROUP BY bidder_name
+          ORDER BY bid_amount DESC
+          LIMIT 10
+        `)
+        .bind(auction.id)
+        .all();
+
+      return new Response(JSON.stringify({ auction, bids: results }), {
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+
+    // ── POST /api/close-auction ───────────────────────────────────────────
+    if (request.method === "POST" && url.pathname === "/api/close-auction") {
+      const auction = await env.DB
+        .prepare("SELECT id FROM Auctions WHERE status = 'active' LIMIT 1")
+        .first();
+
+      if (!auction) {
+        return new Response(JSON.stringify({ error: "No active auction" }), {
+          status: 404,
+          headers: { ...cors, "Content-Type": "application/json" },
+        });
+      }
+
+      // Mark auction as closed
+      await env.DB
+        .prepare("UPDATE Auctions SET status = 'closed' WHERE id = ?")
+        .bind(auction.id)
+        .run();
+
+      // Find the winner (highest single bid)
+      const winner = await env.DB
+        .prepare(
+          "SELECT bidder_name, MAX(bid_amount) AS bid_amount FROM Bids WHERE auction_id = ? LIMIT 1"
+        )
+        .bind(auction.id)
+        .first();
+
+      // Generate a mock checkout link (replace with real payment gateway in prod)
+      const checkoutLink = winner
+        ? `https://pay.example.com/checkout?buyer=${encodeURIComponent(winner.bidder_name)}&amount=${winner.bid_amount}&auction=${auction.id}`
+        : null;
+
+      return new Response(JSON.stringify({ closed: true, winner, checkoutLink }), {
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+
+    return new Response("Not Found", { status: 404, headers: cors });
+  },
+};
